@@ -1,6 +1,6 @@
 Daedalus Revised - Automated Recon Suite
 
-Daedalus Revised is a comprehensive bash-based reconnaissance automation tool for cybersecurity professionals. Designed for passive and semi-active enumeration with optional OSINT enrichment, Daedalus gathers, analyzes, and presents recon data for a given domain in a beautifully styled HTML report. It defaults to a no-API, stealth-aware mode for cautious engagement, but can be escalated for full API-powered enrichment.
+Daedalus Revised is a comprehensive bash-based reconnaissance automation tool for cybersecurity professionals. Designed for passive and semi-active enumeration with optional OSINT enrichment, Daedalus gathers, analyzes, and presents recon data for a given domain in a HTML report. It defaults to a no-API, stealth-aware mode for cautious engagement, but can be escalated for full API-powered enrichment.
 
 
 
