@@ -23,6 +23,12 @@ if ! [[ "$TARGET" =~ ^([a-zA-Z0-9][-a-zA-Z0-9]*\.)+[a-zA-Z]{2,}$ ]]; then
 fi
 
 WORKDIR="recon-$TARGET-$TIMESTAMP"
+LOGFILE="$WORKDIR/daedalus.log"
+mkdir -p "$WORKDIR/osint"
+cd "$WORKDIR" || exit 1
+export PS4='+ $(date "+%Y-%m-%d %H:%M:%S") '
+set -x  # Enable debug trace mode for full command logging
+
 
 print_banner() {
     echo -e "\e[96m[+] $1\e[0m"
@@ -65,8 +71,8 @@ if [[ "$NO_API" == false ]]; then
   fi
 fi
 
-mkdir -p "$WORKDIR/osint"
-cd "$WORKDIR" || exit 1
+exec > >(tee -a "$LOGFILE") 2>&1
+
 
 print_banner "Starting Recon on: $TARGET"
 print_banner "NO_API Mode: $NO_API | Stealth Mode: $STEALTH"
@@ -79,13 +85,20 @@ else
 fi
 
 assetfinder --subs-only "$TARGET" > assetfinder.txt
-crtsh_raw=$(curl -s "https://crt.sh/?q=%25.$TARGET&output=json")
-if echo "$crtsh_raw" | jq empty 2>/dev/null; then
+print_banner "Fetching crt.sh data..."
+crtsh_raw=$(curl -s "https://crt.sh/?q=%25.$TARGET&output=json" || true)
+
+if [[ -z "$crtsh_raw" ]]; then
+    echo -e "\e[93m[!] Warning: crt.sh returned empty response. Skipping.\e[0m"
+    touch crtsh.txt
+elif echo "$crtsh_raw" | jq empty >/dev/null 2>&1; then
     echo "$crtsh_raw" | jq -r '.[].name_value' | sed 's/\*\.//g' | sort -u > crtsh.txt
 else
-    echo -e "\e[93m[!] Warning: crt.sh did not return valid JSON. Skipping.\e[0m"
+    echo -e "\e[93m[!] Warning: crt.sh returned invalid JSON. Skipping.\e[0m"
     touch crtsh.txt
 fi
+
+
 print_banner "Running amass (max 2 min)..."
 if [[ -f ../good_resolvers.txt ]]; then
     if ! timeout 120s amass enum -passive -d "$TARGET" -rf ../good_resolvers.txt > amass.txt 2>/dev/null; then
@@ -104,38 +117,79 @@ cat subfinder.txt assetfinder.txt crtsh.txt amass.txt | sort -u > all_subs.txt
 
 if [ ! -s all_subs.txt ]; then
     echo -e "\e[91m[!] No subdomains found, exiting.\e[0m"
-    exit 1
+    echo -e "\e[93m[!] No subdomains found, continuing anyway for debug...\e[0m"
+sleep 2
+
 fi
 
+echo "--- all_subs.txt ---"
+cat all_subs.txt
+
+
 print_banner "Running DNS resolution..."
-dnsx -l all_subs.txt -silent -resp-only > resolved.txt
+dnsx -l all_subs.txt -silent > resolved.txt
+
+echo "--- resolved.txt ---"
+cat resolved.txt
 
 RESOLVED_COUNT=$(wc -l < resolved.txt)
 echo -e "\e[96m[+] Resolved $RESOLVED_COUNT subdomains\e[0m"
 
-
-print_banner "Running HTTP probing..."
-httpx resolved.txt -title -tech-detect -status-code -no-color > httpx.txt
-
-if [ "$STEALTH" = false ]; then
-    print_banner "Running port scanning with naabu..."
-    naabu -i resolved.txt -top-ports 100 -silent > ports.txt
+if [ ! -s resolved.txt ]; then
+    echo -e "\e[93m[!] No resolved domains. Skipping HTTP probing and port scan.\e[0m"
+    touch httpx.txt ports.txt
 else
-    print_banner "Stealth mode enabled: Skipping port scan."
+    print_banner "Running HTTP probing..."
+    httpx -l resolved.txt -title -tech-detect -status-code -no-color > httpx.txt
+
+    if [ "$STEALTH" = false ]; then
+        print_banner "Running port scanning with naabu..."
+        naabu -list resolved.txt -top-ports 100 -silent > ports.txt
+    else
+        print_banner "Stealth mode enabled: Skipping port scan."
+        touch ports.txt
+    fi
 fi
 
+
 print_banner "Scraping JS files with gau..."
-cat resolved.txt | gau --blacklist png,jpg,jpeg,gif,svg,woff,ttf,css | grep ".js" | sort -u > js_files.txt
+touch js_files.txt  # Ensure file exists even if empty
+
+while read -r url; do
+    gau --blacklist png,jpg,jpeg,gif,svg,woff,ttf,css "$url" 2>/dev/null | grep "\.js" || true
+done < resolved.txt | sort -u > js_files.txt
+
+if [ ! -s js_files.txt ]; then
+    echo -e "\e[93m[!] No JS files found. Skipping JS analysis.\e[0m"
+fi
+
+
+if [ ! -s resolved.txt ]; then
+    echo "[!] No resolved domains, skipping ffuf."
+else
+    mkdir -p ffuf_results
+    for url in $(cat resolved.txt); do
+        [[ "$url" =~ ^http ]] || url="https://$url"
+        ffuf -u "$url/FUZZ" -w /usr/share/wordlists/dirb/common.txt \
+            -of md -o "ffuf_results/$(echo "$url" | sed 's|https\?://||g').md" -t 25 || true
+        sleep 1
+    done
+fi
 
 print_banner "Running ffuf fuzzing..."
 mkdir -p ffuf_results
 for url in $(cat resolved.txt); do
-    ffuf -u "$url/FUZZ" -w /usr/share/wordlists/dirb/common.txt -of md -o ffuf_results/$(echo "$url" | sed 's|https\?://||g').md -t 25
+    [[ "$url" =~ ^http ]] || url="https://$url"  # Ensure valid URL
+    ffuf -u "$url/FUZZ" -w /usr/share/wordlists/dirb/common.txt \
+        -of md -o ffuf_results/$(echo "$url" | sed 's|https\?://||g').md -t 25 || \
+        echo -e "\e[93m[!] FFUF failed for $url\e[0m"
     sleep 1
 done
 
+
 print_banner "Running nuclei vulnerability scan..."
-nuclei -l resolved.txt -t cves/ -severity medium,high,critical -silent > nuclei-results.txt
+nuclei -l resolved.txt -t cves/ -severity medium,high,critical -v | tee nuclei-results.txt
+
 
 print_banner "Running OSINT enrichment..."
 echo "var mapMarkers = []" > osint/geo.js
@@ -145,9 +199,28 @@ while read -r domain; do
         ipinfo=$(curl -s "https://ipinfo.io/$ip")
         echo "$ipinfo" > "osint/$domain-ipinfo.json"
         echo $ipinfo | jq -r '"mapMarkers.push({lat: \(.loc|split(",")[0]), lng: \(.loc|split(",")[1]), label: \"$domain ($ip)\"});"' >> osint/geo.js
-        curl -sG --data-urlencode "ip=$ip" "https://api.abuseipdb.com/api/v2/check" \
-            -H "Key: 33b3d871e9b4dda3774234e4e5cb174bf91b8a45b2887193736bd6f6ea86d414fb35f1ba089da714" -H "Accept: application/json" > "osint/$domain-abuseipdb.json"
-        shodan host "$ip" > "osint/$domain-shodan.txt"
+# Only run AbuseIPDB check if API key is set and not placeholder
+if [[ -n "${ABUSE_API_KEY:-}" && "$ABUSE_API_KEY" != "YOUR_ABUSEIPDB_API_KEY" ]]; then
+    abuse_response=$(curl -sG --data-urlencode "ip=$ip" "https://api.abuseipdb.com/api/v2/check" \
+        -H "Key: $ABUSE_API_KEY" \
+        -H "Accept: application/json")
+
+    if echo "$abuse_response" | jq . >/dev/null 2>&1; then
+        echo "$abuse_response" > "osint/$domain-abuseipdb.json"
+    else
+        echo -e "\e[93m[!] Warning: AbuseIPDB returned invalid response for $ip. Skipping.\e[0m"
+        touch "osint/$domain-abuseipdb.json"
+    fi
+else
+    echo -e "\e[93m[!] AbuseIPDB API key not set or still default. Skipping AbuseIPDB enrichment.\e[0m"
+    touch "osint/$domain-abuseipdb.json"
+fi
+
+        if ! shodan info >/dev/null 2>&1; then
+    echo -e "\e[93m[!] Shodan CLI is not initialized. Skipping Shodan enrichment.\e[0m"
+else
+    shodan host "$ip" > "osint/$domain-shodan.txt"
+fi
     fi
     sleep 1
 done < resolved.txt
