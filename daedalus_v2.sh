@@ -58,10 +58,11 @@ do
     esac
 done
 
-# Ensure API key is set
-if grep -q 'YOUR_ABUSEIPDB_API_KEY' "$0"; then
-    echo -e "\e[91m[!] You must set your AbuseIPDB API key in the script before continuing.\e[0m"
+if [[ "$NO_API" == false ]]; then
+  if [[ -z "${ABUSE_API_KEY:-}" || "$ABUSE_API_KEY" == "YOUR_ABUSEIPDB_API_KEY" ]]; then
+    echo "❌ API mode requires a valid AbuseIPDB API key. Set it in the script or via an environment variable."
     exit 1
+  fi
 fi
 
 mkdir -p "$WORKDIR/osint"
@@ -78,8 +79,26 @@ else
 fi
 
 assetfinder --subs-only "$TARGET" > assetfinder.txt
-curl -s "https://crt.sh/?q=%25.$TARGET&output=json" | jq -r '.[].name_value' | sed 's/\*\.//g' | sort -u > crtsh.txt
-amass enum -passive -d "$TARGET" > amass.txt
+crtsh_raw=$(curl -s "https://crt.sh/?q=%25.$TARGET&output=json")
+if echo "$crtsh_raw" | jq empty 2>/dev/null; then
+    echo "$crtsh_raw" | jq -r '.[].name_value' | sed 's/\*\.//g' | sort -u > crtsh.txt
+else
+    echo -e "\e[93m[!] Warning: crt.sh did not return valid JSON. Skipping.\e[0m"
+    touch crtsh.txt
+fi
+print_banner "Running amass (max 2 min)..."
+if [[ -f ../good_resolvers.txt ]]; then
+    if ! timeout 120s amass enum -passive -d "$TARGET" -rf ../good_resolvers.txt > amass.txt 2>/dev/null; then
+        echo -e "\e[93m[!] Amass failed or timed out. Continuing without it.\e[0m"
+        touch amass.txt
+    fi
+else
+    if ! timeout 120s amass enum -passive -d "$TARGET" > amass.txt 2>/dev/null; then
+        echo -e "\e[93m[!] Amass failed or timed out. Continuing without it.\e[0m"
+        touch amass.txt
+    fi
+fi
+
 
 cat subfinder.txt assetfinder.txt crtsh.txt amass.txt | sort -u > all_subs.txt
 
@@ -91,8 +110,12 @@ fi
 print_banner "Running DNS resolution..."
 dnsx -l all_subs.txt -silent -resp-only > resolved.txt
 
+RESOLVED_COUNT=$(wc -l < resolved.txt)
+echo -e "\e[96m[+] Resolved $RESOLVED_COUNT subdomains\e[0m"
+
+
 print_banner "Running HTTP probing..."
-cat resolved.txt | httpx -silent -title -tech-detect -status-code > httpx.txt
+httpx resolved.txt -title -tech-detect -status-code -no-color > httpx.txt
 
 if [ "$STEALTH" = false ]; then
     print_banner "Running port scanning with naabu..."
@@ -123,7 +146,7 @@ while read -r domain; do
         echo "$ipinfo" > "osint/$domain-ipinfo.json"
         echo $ipinfo | jq -r '"mapMarkers.push({lat: \(.loc|split(",")[0]), lng: \(.loc|split(",")[1]), label: \"$domain ($ip)\"});"' >> osint/geo.js
         curl -sG --data-urlencode "ip=$ip" "https://api.abuseipdb.com/api/v2/check" \
-            -H "Key: YOUR_ABUSEIPDB_API_KEY" -H "Accept: application/json" > "osint/$domain-abuseipdb.json"
+            -H "Key: 33b3d871e9b4dda3774234e4e5cb174bf91b8a45b2887193736bd6f6ea86d414fb35f1ba089da714" -H "Accept: application/json" > "osint/$domain-abuseipdb.json"
         shodan host "$ip" > "osint/$domain-shodan.txt"
     fi
     sleep 1
